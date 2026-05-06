@@ -6,27 +6,27 @@ require('dotenv').config();
 const express  = require('express');
 const cors     = require('cors');
 const NodeCache = require('node-cache');
-
+ 
 const app   = express();
 const cache = new NodeCache({ stdTTL: 3600 }); // Cache 1h
-
+ 
 app.use(cors());
 app.use(express.json());
-
+ 
 // ── Config ──────────────────────────────────────────
 const EBAY_CLIENT_ID     = process.env.EBAY_CLIENT_ID     || '';
 const EBAY_CLIENT_SECRET = process.env.EBAY_CLIENT_SECRET || '';
 const POKEMONTCG_API_KEY = process.env.POKEMONTCG_API_KEY || '';
 const PORT               = process.env.PORT || 3001;
-
+ 
 // ── Token eBay (OAuth client credentials) ───────────
 let ebayToken = null;
 let ebayTokenExpiry = 0;
-
+ 
 async function getEbayToken() {
   if (ebayToken && Date.now() < ebayTokenExpiry) return ebayToken;
   if (!EBAY_CLIENT_ID || !EBAY_CLIENT_SECRET) return null;
-
+ 
   const creds = Buffer.from(`${EBAY_CLIENT_ID}:${EBAY_CLIENT_SECRET}`).toString('base64');
   const res = await fetch('https://api.ebay.com/identity/v1/oauth2/token', {
     method: 'POST',
@@ -36,7 +36,7 @@ async function getEbayToken() {
     },
     body: 'grant_type=client_credentials&scope=https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope',
   });
-
+ 
   if (!res.ok) {
     console.warn('⚠️  eBay token error:', res.status);
     return null;
@@ -46,7 +46,7 @@ async function getEbayToken() {
   ebayTokenExpiry = Date.now() + (data.expires_in - 300) * 1000;
   return ebayToken;
 }
-
+ 
 // ── Taux de change EUR/USD ───────────────────────────
 async function getEurRate() {
   const cached = cache.get('eur_rate');
@@ -61,40 +61,81 @@ async function getEurRate() {
     return 0.92; // Fallback
   }
 }
-
+ 
 // ── Prix TCGPlayer via pokemontcg.io ─────────────────
-async function getTcgPrices(cardId) {
+async function getTcgPrices(cardId, cardName = '', setName = '') {
   const cacheKey = `tcg_${cardId}`;
   const cached = cache.get(cacheKey);
-  if (cached) return cached;
-
+  if (cached !== undefined) return cached;
+ 
   const headers = POKEMONTCG_API_KEY
     ? { 'X-Api-Key': POKEMONTCG_API_KEY }
     : {};
-
-  const res = await fetch(`https://api.pokemontcg.io/v2/cards/${cardId}`, { headers });
-  if (!res.ok) return null;
-  const data = await res.json();
-  const prices = data.data?.tcgplayer?.prices || null;
-  cache.set(cacheKey, prices);
-  return prices;
+ 
+  // Tentative 1 : recherche par ID exact
+  try {
+    const res = await fetch(`https://api.pokemontcg.io/v2/cards/${cardId}`, { headers });
+    if (res.ok) {
+      const data = await res.json();
+      const prices = data.data?.tcgplayer?.prices || null;
+      if (prices && Object.keys(prices).length > 0) {
+        cache.set(cacheKey, prices);
+        return prices;
+      }
+    }
+  } catch (e) {
+    console.warn('TCG by ID error:', e.message);
+  }
+ 
+  // Tentative 2 : recherche par nom de carte (pour nouvelles séries MEG non encore indexées)
+  if (cardName) {
+    try {
+      const query = encodeURIComponent(`name:"${cardName}"`);
+      const res = await fetch(
+        `https://api.pokemontcg.io/v2/cards?q=${query}&pageSize=10&orderBy=-set.releaseDate`,
+        { headers }
+      );
+      if (res.ok) {
+        const data = await res.json();
+        const cards = data.data || [];
+        // Chercher la carte avec des prix TCGPlayer valides
+        for (const card of cards) {
+          const prices = card.tcgplayer?.prices;
+          if (prices && Object.keys(prices).length > 0) {
+            // Vérifier que le nom correspond bien
+            const nameMatch = card.name.toLowerCase().includes(cardName.toLowerCase().split(' ')[0]);
+            if (nameMatch) {
+              cache.set(cacheKey, prices);
+              return prices;
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('TCG by name error:', e.message);
+    }
+  }
+ 
+  // Aucun prix trouvé — mettre null en cache 30 min pour ne pas re-chercher
+  cache.set(cacheKey, null, 1800);
+  return null;
 }
-
+ 
 // ── Recherche eBay (annonces actives + vendues) ───────
 async function getEbayPrices(cardName, setName, variant) {
   const cacheKey = `ebay_${cardName}_${variant}`;
   const cached = cache.get(cacheKey);
   if (cached) return cached;
-
+ 
   const token = await getEbayToken();
   if (!token) return null;
-
+ 
   // Construire une query précise
   const variantTerm = variant === 'R' ? 'reverse holo'
                     : variant === 'H' ? 'holo'
                     : '';
   const query = `${cardName} pokemon card ${setName} ${variantTerm} french`.trim();
-
+ 
   try {
     // Browse API — annonces actives (seul endpoint public disponible)
     const res = await fetch(
@@ -113,17 +154,17 @@ async function getEbayPrices(cardName, setName, variant) {
         },
       }
     );
-
+ 
     if (!res.ok) {
       console.warn('eBay Browse error:', res.status);
       return null;
     }
-
+ 
     const data = await res.json();
     const items = data.itemSummaries || [];
-
+ 
     if (items.length === 0) return null;
-
+ 
     // Extraire les prix en EUR
     const prices = items
       .map(item => {
@@ -135,13 +176,13 @@ async function getEbayPrices(cardName, setName, variant) {
       })
       .filter(p => p !== null && p > 0.10 && p < 500)
       .sort((a, b) => a - b);
-
+ 
     if (prices.length === 0) return null;
-
+ 
     // Supprimer les outliers (10% haut et bas)
     const trim = Math.floor(prices.length * 0.1);
     const trimmed = prices.slice(trim, prices.length - trim || undefined);
-
+ 
     const result = {
       low:    Math.round(trimmed[0] * 100) / 100,
       median: Math.round(trimmed[Math.floor(trimmed.length / 2)] * 100) / 100,
@@ -149,7 +190,7 @@ async function getEbayPrices(cardName, setName, variant) {
       count:  items.length,
       source: 'ebay_active',
     };
-
+ 
     cache.set(cacheKey, result, 1800); // Cache 30 min
     return result;
   } catch (err) {
@@ -157,17 +198,17 @@ async function getEbayPrices(cardName, setName, variant) {
     return null;
   }
 }
-
+ 
 // ── Calcul prix final (mix TCG + eBay) ───────────────
 function computeFinalPrice(tcg, ebay, variant, eurRate) {
   const variantKey = variant === 'N' ? 'normal'
                    : variant === 'R' ? 'reverseHolofoil'
                    : variant === 'H' ? 'holofoil'
                    : 'normal';
-
+ 
   let tcgEur = null;
   let tcgConfidence = 0;
-
+ 
   if (tcg && tcg[variantKey]) {
     const t = tcg[variantKey];
     const mktUsd = t.market || t.mid || ((t.low + t.high) / 2);
@@ -177,7 +218,7 @@ function computeFinalPrice(tcg, ebay, variant, eurRate) {
       tcgConfidence = t.market ? 90 : 70;
     }
   }
-
+ 
   let ebayEur = null;
   let ebayConfidence = 0;
   if (ebay) {
@@ -185,12 +226,12 @@ function computeFinalPrice(tcg, ebay, variant, eurRate) {
     // Plus le nombre d'annonces est élevé, plus la confiance est haute
     ebayConfidence = Math.min(85, 40 + ebay.count * 3);
   }
-
+ 
   // Pondération : si les deux sources dispo, moyenne pondérée
   let finalPrice = null;
   let confidence = 0;
   let sources = [];
-
+ 
   if (tcgEur && ebayEur) {
     // Les deux sources : moyenne pondérée
     const totalW = tcgConfidence + ebayConfidence;
@@ -206,15 +247,15 @@ function computeFinalPrice(tcg, ebay, variant, eurRate) {
     confidence = ebayConfidence;
     sources = ['eBay'];
   }
-
+ 
   if (!finalPrice) return null;
-
+ 
   // Arrondir proprement
   const rounded = finalPrice < 1    ? Math.round(finalPrice * 100) / 100
                 : finalPrice < 10   ? Math.round(finalPrice * 10) / 10
                 : finalPrice < 100  ? Math.round(finalPrice)
                 : Math.round(finalPrice);
-
+ 
   return {
     price:      rounded,
     currency:   'EUR',
@@ -227,7 +268,7 @@ function computeFinalPrice(tcg, ebay, variant, eurRate) {
     trend: computeTrend(tcg, variantKey, eurRate),
   };
 }
-
+ 
 function computeTrend(tcg, variantKey, eurRate) {
   if (!tcg || !tcg[variantKey]) return null;
   const t = tcg[variantKey];
@@ -238,33 +279,33 @@ function computeTrend(tcg, variantKey, eurRate) {
   if (t.market && t.mid && t.market < t.mid * 0.95) return 'down';
   return 'stable';
 }
-
+ 
 // ══════════════════════════════════════════════════════
 //  ROUTES
 // ══════════════════════════════════════════════════════
-
+ 
 // GET /price/:cardId?variant=N|R|H&cardName=...&setName=...
 app.get('/price/:cardId', async (req, res) => {
   const { cardId } = req.params;
   const { variant = 'N', cardName = '', setName = '' } = req.query;
-
+ 
   const cacheKey = `price_${cardId}_${variant}`;
   const cached = cache.get(cacheKey);
   if (cached) return res.json(cached);
-
+ 
   try {
     const [tcg, ebay, eurRate] = await Promise.all([
-      getTcgPrices(cardId),
+      getTcgPrices(cardId, cardName, setName),
       getEbayPrices(cardName, setName, variant),
       getEurRate(),
     ]);
-
+ 
     const result = computeFinalPrice(tcg, ebay, variant, eurRate);
-
+ 
     if (!result) {
       return res.status(404).json({ error: 'Prix non disponible' });
     }
-
+ 
     cache.set(cacheKey, result, 1800);
     res.json(result);
   } catch (err) {
@@ -272,25 +313,25 @@ app.get('/price/:cardId', async (req, res) => {
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
-
+ 
 // GET /prices — batch (jusqu'à 20 cartes à la fois)
 app.post('/prices', async (req, res) => {
   const { cards } = req.body; // [{cardId, variant, cardName, setName}]
   if (!Array.isArray(cards) || cards.length === 0) {
     return res.status(400).json({ error: 'Tableau de cartes requis' });
   }
-
+ 
   const eurRate = await getEurRate();
   const results = {};
-
+ 
   await Promise.allSettled(
     cards.slice(0, 20).map(async ({ cardId, variant = 'N', cardName = '', setName = '' }) => {
       const cacheKey = `price_${cardId}_${variant}`;
       const cached = cache.get(cacheKey);
       if (cached) { results[`${cardId}_${variant}`] = cached; return; }
-
+ 
       const [tcg, ebay] = await Promise.all([
-        getTcgPrices(cardId),
+        getTcgPrices(cardId, cardName, setName),
         getEbayPrices(cardName, setName, variant),
       ]);
       const r = computeFinalPrice(tcg, ebay, variant, eurRate);
@@ -300,10 +341,10 @@ app.post('/prices', async (req, res) => {
       }
     })
   );
-
+ 
   res.json(results);
 });
-
+ 
 // GET /health
 app.get('/health', (req, res) => {
   res.json({
@@ -313,7 +354,7 @@ app.get('/health', (req, res) => {
     cacheSize: cache.keys().length,
   });
 });
-
+ 
 app.listen(PORT, () => {
   console.log(`\n🎴 Pokédex Binks — Serveur de Prix`);
   console.log(`   http://localhost:${PORT}`);
